@@ -5,9 +5,15 @@ WORKDIR /app
 
 # 构建参数
 ARG VITE_API_URL=http://localhost:8000
+ARG USE_CHINA_MIRROR=false
 
 # 设置环境变量
 ENV VITE_API_URL=$VITE_API_URL
+
+# 配置 npm 使用国内镜像源（可选）
+RUN if [ "$USE_CHINA_MIRROR" = "true" ]; then \
+    npm config set registry https://registry.npmmirror.com; \
+    fi
 
 # 复制 package 文件
 COPY package*.json ./

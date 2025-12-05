@@ -91,15 +91,99 @@ check_root() {
     fi
 }
 
+# 检测是否在国内网络
+detect_china_network() {
+    # 检测是否能访问 Google（简单判断）
+    if ! curl -s --connect-timeout 3 --max-time 5 https://www.google.com > /dev/null 2>&1; then
+        return 0  # 在国内
+    fi
+    return 1  # 不在国内
+}
+
+# 下载文件（带重试和镜像源）
+download_with_retry() {
+    local url=$1
+    local output=$2
+    local max_attempts=3
+    local attempt=1
+    
+    # 国内镜像源列表
+    local mirror_urls=(
+        "$url"  # 原始 URL
+    )
+    
+    # 如果是 GitHub，添加镜像源
+    if echo "$url" | grep -q "github.com"; then
+        mirror_urls=(
+            "https://ghproxy.com/$url"  # ghproxy
+            "https://mirror.ghproxy.com/$url"  # mirror.ghproxy
+            "https://github.com.cnpmjs.org/$(echo $url | sed 's|https://github.com/||')"  # cnpmjs
+            "$url"
+        )
+    fi
+    
+    # 如果是 Docker 官方源，添加国内镜像
+    if echo "$url" | grep -q "download.docker.com"; then
+        mirror_urls=(
+            "https://mirrors.aliyun.com/docker-ce/$(echo $url | sed 's|https://download.docker.com/||')"
+            "https://mirrors.tuna.tsinghua.edu.cn/docker-ce/$(echo $url | sed 's|https://download.docker.com/||')"
+            "$url"
+        )
+    fi
+    
+    for mirror_url in "${mirror_urls[@]}"; do
+        attempt=1
+        while [ $attempt -le $max_attempts ]; do
+            if curl -fsSL --connect-timeout 10 --max-time 30 "$mirror_url" -o "$output" 2>/dev/null; then
+                return 0
+            fi
+            attempt=$((attempt + 1))
+            sleep 2
+        done
+    done
+    
+    return 1
+}
+
+# 配置 Docker 镜像加速器
+configure_docker_mirror() {
+    if detect_china_network; then
+        print_log "检测到国内网络，配置 Docker 镜像加速器..."
+        
+        mkdir -p /etc/docker
+        
+        # 配置镜像加速器（使用多个国内镜像源）
+        cat > /etc/docker/daemon.json << EOF
+{
+  "registry-mirrors": [
+    "https://docker.mirrors.ustc.edu.cn",
+    "https://hub-mirror.c.163.com",
+    "https://mirror.baidubce.com",
+    "https://ccr.ccs.tencentyun.com"
+  ]
+}
+EOF
+        
+        print_success "Docker 镜像加速器配置完成"
+    fi
+}
+
 # 安装 Docker
 install_docker() {
     if check_command docker && check_command docker-compose; then
         print_success "Docker 已安装"
         docker --version
+        configure_docker_mirror
+        systemctl restart docker 2>/dev/null || true
         return 0
     fi
 
     print_log "开始安装 Docker..."
+    
+    # 检测是否在国内
+    if detect_china_network; then
+        print_info "检测到国内网络环境，将使用国内镜像源"
+    fi
     
     if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
         apt-get update
@@ -107,35 +191,93 @@ install_docker() {
             ca-certificates \
             curl \
             gnupg \
-            lsb-release
+            lsb-release \
+            wget
         
         mkdir -p /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/$OS/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         
-        echo \
-          "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS \
-          $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+        # 下载 Docker GPG 密钥（自动使用镜像源）
+        print_log "下载 Docker GPG 密钥..."
+        if detect_china_network; then
+            # 优先使用国内镜像
+            if ! curl -fsSL --connect-timeout 10 "https://mirrors.aliyun.com/docker-ce/linux/$OS/gpg" -o /tmp/docker.gpg 2>/dev/null; then
+                if ! curl -fsSL --connect-timeout 10 "https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/$OS/gpg" -o /tmp/docker.gpg 2>/dev/null; then
+                    if ! download_with_retry "https://download.docker.com/linux/$OS/gpg" "/tmp/docker.gpg"; then
+                        print_error "无法下载 Docker GPG 密钥"
+                        exit 1
+                    fi
+                fi
+            fi
+        else
+            if ! download_with_retry "https://download.docker.com/linux/$OS/gpg" "/tmp/docker.gpg"; then
+                print_error "无法下载 Docker GPG 密钥"
+                exit 1
+            fi
+        fi
+        
+        gpg --dearmor -o /etc/apt/keyrings/docker.gpg < /tmp/docker.gpg
+        rm -f /tmp/docker.gpg
+        
+        # 添加 Docker 仓库
+        ARCH=$(dpkg --print-architecture)
+        CODENAME=$(lsb_release -cs)
+        
+        # 使用国内镜像源（如果检测到国内网络）
+        if detect_china_network; then
+            print_log "使用阿里云 Docker 镜像源"
+            echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/$OS $CODENAME stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+        else
+            echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS $CODENAME stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+        fi
         
         apt-get update
         apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
         
-        # 安装 docker-compose standalone
-        curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-        chmod +x /usr/local/bin/docker-compose
+        # 安装 docker-compose standalone（使用镜像源）
+        print_log "安装 docker-compose..."
+        COMPOSE_URL="https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)"
+        if ! download_with_retry "$COMPOSE_URL" "/usr/local/bin/docker-compose"; then
+            print_warning "无法下载 docker-compose，将使用 docker compose plugin"
+        else
+            chmod +x /usr/local/bin/docker-compose
+        fi
         
     elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ]; then
         yum install -y yum-utils
-        yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+        
+        # 使用国内镜像源
+        if detect_china_network; then
+            print_log "使用阿里云 Docker 镜像源"
+            yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+        else
+            yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+        fi
+        
         yum install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
         
-        curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-        chmod +x /usr/local/bin/docker-compose
+        COMPOSE_URL="https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)"
+        if ! download_with_retry "$COMPOSE_URL" "/usr/local/bin/docker-compose"; then
+            print_warning "无法下载 docker-compose，将使用 docker compose plugin"
+        else
+            chmod +x /usr/local/bin/docker-compose
+        fi
     fi
     
+    # 配置镜像加速器
+    configure_docker_mirror
+    
+    # 启动 Docker
     systemctl start docker
     systemctl enable docker
     
-    print_success "Docker 安装完成"
+    # 验证安装
+    if check_command docker; then
+        print_success "Docker 安装完成"
+        docker --version
+    else
+        print_error "Docker 安装失败"
+        exit 1
+    fi
 }
 
 # 配置环境变量
@@ -189,6 +331,12 @@ setup_env() {
     # 生成 JWT Secret
     JWT_SECRET=$(generate_random_string)
     
+    # 检测是否使用国内镜像
+    USE_MIRROR="false"
+    if detect_china_network; then
+        USE_MIRROR="true"
+    fi
+    
     # 创建 .env 文件
     cat > .env << EOF
 # GitHub OAuth
@@ -215,6 +363,9 @@ UPLOAD_DIR=./uploads
 
 # Frontend API URL
 VITE_API_URL=$BACKEND_URL
+
+# Docker 构建镜像源（国内服务器设置为 true）
+USE_CHINA_MIRROR=$USE_MIRROR
 EOF
     
     print_success "环境变量配置完成"
@@ -252,23 +403,43 @@ deploy_services() {
         exit 1
     fi
     
-    # 构建镜像
+    # 检查 docker-compose 命令
+    if check_command docker-compose; then
+        COMPOSE_CMD="docker-compose"
+    elif docker compose version > /dev/null 2>&1; then
+        COMPOSE_CMD="docker compose"
+        print_info "使用 docker compose plugin"
+    else
+        print_error "未找到 docker-compose 命令"
+        exit 1
+    fi
+    
+    # 构建镜像（如果检测到国内网络，使用镜像源）
     print_log "正在构建 Docker 镜像..."
-    docker-compose build --quiet
+    if detect_china_network; then
+        print_info "使用国内镜像源构建..."
+        export DOCKER_BUILDKIT=1
+        $COMPOSE_CMD build \
+            --build-arg USE_CHINA_MIRROR=true \
+            --build-arg VITE_API_URL=${VITE_API_URL:-http://localhost:8000}
+    else
+        $COMPOSE_CMD build
+    fi
     
     # 启动服务
     print_log "正在启动服务..."
-    docker-compose up -d
+    $COMPOSE_CMD up -d
     
     # 等待服务启动
     print_log "等待服务启动..."
-    sleep 10
+    sleep 15
     
     # 检查服务状态
-    if docker-compose ps | grep -q "Up"; then
+    if $COMPOSE_CMD ps | grep -q "Up"; then
         print_success "服务启动成功"
     else
-        print_error "服务启动失败，请检查日志: docker-compose logs"
+        print_error "服务启动失败，请检查日志: $COMPOSE_CMD logs"
+        print_info "查看详细日志: $COMPOSE_CMD logs -f"
         exit 1
     fi
 }
@@ -287,11 +458,18 @@ show_result() {
     echo
     print_warning "如果您使用的是云服务器，请在安全组中打开端口 8000 和 5173"
     echo
+    # 检测 docker-compose 命令
+    if check_command docker-compose; then
+        COMPOSE_CMD="docker-compose"
+    else
+        COMPOSE_CMD="docker compose"
+    fi
+    
     print_info "常用命令:"
-    echo "  查看日志: cd $PROJECT_DIR && docker-compose logs -f"
-    echo "  停止服务: cd $PROJECT_DIR && docker-compose down"
-    echo "  重启服务: cd $PROJECT_DIR && docker-compose restart"
-    echo "  更新服务: cd $PROJECT_DIR && git pull && docker-compose up -d --build"
+    echo "  查看日志: cd $PROJECT_DIR && $COMPOSE_CMD logs -f"
+    echo "  停止服务: cd $PROJECT_DIR && $COMPOSE_CMD down"
+    echo "  重启服务: cd $PROJECT_DIR && $COMPOSE_CMD restart"
+    echo "  更新服务: cd $PROJECT_DIR && git pull && $COMPOSE_CMD up -d --build"
     echo
     print_warning "为了您的服务器安全，请妥善保管 GitHub OAuth 配置信息"
     echo
@@ -321,10 +499,28 @@ prepare_project() {
             fi
         fi
         mkdir -p $(dirname $PROJECT_DIR)
-        git clone $REPO_URL $PROJECT_DIR
+        
+        # 如果检测到国内网络，使用镜像源克隆
+        if detect_china_network; then
+            print_log "检测到国内网络，使用 GitHub 镜像源克隆..."
+            # 尝试使用 ghproxy 代理
+            MIRROR_REPO_URL="https://ghproxy.com/$REPO_URL"
+            if git clone "$MIRROR_REPO_URL" "$PROJECT_DIR" 2>/dev/null; then
+                print_success "使用镜像源克隆成功"
+            else
+                print_warning "镜像源克隆失败，尝试直接克隆..."
+                git clone $REPO_URL $PROJECT_DIR
+            fi
+        else
+            git clone $REPO_URL $PROJECT_DIR
+        fi
     else
         print_log "项目目录已存在，更新代码..."
         cd $PROJECT_DIR
+        if detect_china_network; then
+            # 配置 git 使用代理（如果需要）
+            git config --global url."https://ghproxy.com/https://github.com/".insteadOf "https://github.com/" 2>/dev/null || true
+        fi
         git pull || true
     fi
     
