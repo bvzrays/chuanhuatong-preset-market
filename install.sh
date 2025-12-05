@@ -236,10 +236,12 @@ install_docker() {
         # 安装 docker-compose standalone（使用镜像源）
         print_log "安装 docker-compose..."
         COMPOSE_URL="https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)"
-        if ! download_with_retry "$COMPOSE_URL" "/usr/local/bin/docker-compose"; then
-            print_warning "无法下载 docker-compose，将使用 docker compose plugin"
-        else
+        if download_with_retry "$COMPOSE_URL" "/tmp/docker-compose"; then
+            mv /tmp/docker-compose /usr/local/bin/docker-compose
             chmod +x /usr/local/bin/docker-compose
+            print_success "docker-compose 安装完成"
+        else
+            print_warning "无法下载 docker-compose，将使用 docker compose plugin"
         fi
         
     elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ]; then
@@ -256,10 +258,12 @@ install_docker() {
         yum install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
         
         COMPOSE_URL="https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)"
-        if ! download_with_retry "$COMPOSE_URL" "/usr/local/bin/docker-compose"; then
-            print_warning "无法下载 docker-compose，将使用 docker compose plugin"
-        else
+        if download_with_retry "$COMPOSE_URL" "/tmp/docker-compose"; then
+            mv /tmp/docker-compose /usr/local/bin/docker-compose
             chmod +x /usr/local/bin/docker-compose
+            print_success "docker-compose 安装完成"
+        else
+            print_warning "无法下载 docker-compose，将使用 docker compose plugin"
         fi
     fi
     
@@ -403,15 +407,27 @@ deploy_services() {
         exit 1
     fi
     
-    # 检查 docker-compose 命令
-    if check_command docker-compose; then
-        COMPOSE_CMD="docker-compose"
-    elif docker compose version > /dev/null 2>&1; then
+    # 检查 docker-compose 命令（优先使用 plugin）
+    if docker compose version > /dev/null 2>&1; then
         COMPOSE_CMD="docker compose"
         print_info "使用 docker compose plugin"
+    elif [ -f "/usr/local/bin/docker-compose" ] && [ -x "/usr/local/bin/docker-compose" ]; then
+        COMPOSE_CMD="/usr/local/bin/docker-compose"
+        print_info "使用 standalone docker-compose"
+    elif check_command docker-compose; then
+        COMPOSE_CMD="docker-compose"
+        print_info "使用系统 docker-compose"
     else
-        print_error "未找到 docker-compose 命令"
-        exit 1
+        print_error "未找到 docker-compose 命令，尝试修复..."
+        # 尝试修复权限
+        if [ -f "/usr/local/bin/docker-compose" ]; then
+            chmod +x /usr/local/bin/docker-compose
+            COMPOSE_CMD="/usr/local/bin/docker-compose"
+            print_success "已修复 docker-compose 权限"
+        else
+            print_error "请手动安装 docker-compose 或使用 docker compose plugin"
+            exit 1
+        fi
     fi
     
     # 构建镜像（如果检测到国内网络，使用镜像源）
@@ -459,7 +475,11 @@ show_result() {
     print_warning "如果您使用的是云服务器，请在安全组中打开端口 8000 和 5173"
     echo
     # 检测 docker-compose 命令
-    if check_command docker-compose; then
+    if docker compose version > /dev/null 2>&1; then
+        COMPOSE_CMD="docker compose"
+    elif [ -f "/usr/local/bin/docker-compose" ] && [ -x "/usr/local/bin/docker-compose" ]; then
+        COMPOSE_CMD="/usr/local/bin/docker-compose"
+    elif check_command docker-compose; then
         COMPOSE_CMD="docker-compose"
     else
         COMPOSE_CMD="docker compose"
