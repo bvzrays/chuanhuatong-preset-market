@@ -540,8 +540,15 @@ prepare_project() {
         if detect_china_network; then
             # 配置 git 使用代理（如果需要）
             git config --global url."https://ghproxy.com/https://github.com/".insteadOf "https://github.com/" 2>/dev/null || true
+            # 如果拉取失败，尝试直接拉取
+            if ! git pull 2>/dev/null; then
+                print_warning "Git 拉取失败，尝试强制更新..."
+                git fetch origin 2>/dev/null || true
+                git reset --hard origin/main 2>/dev/null || git reset --hard origin/master 2>/dev/null || true
+            fi
+        else
+            git pull || true
         fi
-        git pull || true
     fi
     
     cd $PROJECT_DIR
